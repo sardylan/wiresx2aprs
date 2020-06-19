@@ -1,0 +1,10 @@
+[APRS-IS]
+Address = rotate.aprs.net
+Port = 14580
+Callsign = xxxxxx
+Password = xxxxx
+Filter = m/400
+Comment = Comment
+
+[Wires-X]
+LogFilePath = C:\Users\User\Documents\WIRESXA\AccHistory\WiresAccess.log
