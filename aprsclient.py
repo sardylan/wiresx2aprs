@@ -43,13 +43,15 @@ class APRSClient(Service, ABC):
     def send(self, data=""):
         _logger.debug("Sending data to APRS-IS: %s" % data.strip())
 
-        if not data:
+        if not data.strip():
             return
 
-        self._aprs_socket.send(data.encode())
+        raw_data = data.strip() + "\r\n"
+
+        self._aprs_socket.send(raw_data.encode())
 
     def login(self):
-        data = "USER %s PASS %s VERS 1.0 filter %s\r\n" % (
+        data = "USER %s PASS %s VERS 1.0 FILTER %s" % (
             self._callsign,
             self._password,
             self._filter
@@ -57,6 +59,6 @@ class APRSClient(Service, ABC):
         self.send(data)
 
     def _job(self):
-        data = self._aprs_socket.recv(4096)
+        data = self._aprs_socket.recv(1024)
         msg = data.decode().strip()
         _logger.info("APRS-IS data received: %s" % msg)

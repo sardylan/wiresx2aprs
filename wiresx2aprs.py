@@ -2,6 +2,7 @@ import argparse
 import configparser
 import datetime
 import logging
+import re
 from abc import ABC
 
 import pytz
@@ -20,6 +21,8 @@ class WiresX2APRS(Service, ABC):
         self._argv = argv
         self._config = configparser.ConfigParser()
 
+        self._datetime_timezone = pytz.utc
+
         self._aprs = APRSClient()
 
     def start(self):
@@ -34,8 +37,8 @@ class WiresX2APRS(Service, ABC):
         packet_filter = self._config.get("APRS-IS", "Filter")
 
         self._aprs.config(address, port, callsign, password, packet_filter)
-        # self._aprs.start()
-        # self._aprs.login()
+        self._aprs.start()
+        self._aprs.login()
 
         super().start()
 
@@ -63,14 +66,37 @@ class WiresX2APRS(Service, ABC):
         _logger.debug("Reading and aprsing config file: %s", config_file_path)
         self._config.read(config_file_path)
 
+        tz_name = self._config.get("Wires-X", "Timezone")
+        self._datetime_timezone = pytz.timezone(tz_name)
+
         _logger.info("Wires-X log file path: %s" % self._config.get("Wires-X", "LogFilePath"))
 
     def _job(self):
         _logger.info("Reading Wires-X log file")
 
+        records = self._parse_wiresx_log()
+
+        now_utc = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
+        now = now_utc.astimezone(self._datetime_timezone)
+        margin = datetime.timedelta(minutes=5)
+
+        for record in records:
+            if record["latitude"] and record["longitude"]:
+                _logger.info("Evaluating time for %s" % record["callsign"])
+
+                if record["datetime"] + margin < now:
+                    _logger.info("Too old record for %s" % record["callsign"])
+                    continue
+
+                self._send_record_to_aprs(record)
+
+        _logger.debug("Closing file")
+
+    def _parse_wiresx_log(self):
         wiresx_logfile_path = self._config.get("Wires-X", "LogFilePath")
 
         _logger.debug("Opening file")
+
         fd = open(wiresx_logfile_path, "r")
 
         records = []
@@ -83,11 +109,12 @@ class WiresX2APRS(Service, ABC):
             records.append(record)
 
         _logger.debug("Sorting records by datetime")
-        records.sort(key=lambda x: x["datetime"], reverse=True)
-        print(records)
 
-        _logger.debug("Closing file")
+        records.sort(key=lambda x: x["datetime"], reverse=True)
+
         fd.close()
+
+        return records
 
     def _parse_wiresx_line(self, rawline):
         line = rawline
@@ -98,17 +125,24 @@ class WiresX2APRS(Service, ABC):
         items = line.split("%")
 
         position = items[6].strip()
-        latitude, longitude = self._parse_position(position)
+        latitude, longitude, latitude_aprs, longitude_aprs = self._parse_position(position)
+
+        record_datetime = datetime.datetime.strptime(
+            items[3].strip(),
+            "%Y/%m/%d %H:%M:%S"
+        ).replace(tzinfo=self._datetime_timezone)
 
         values = {
             "callsign": items[0].strip().upper(),
             "serial": items[1].strip(),
             "description": items[2].strip(),
-            "datetime": datetime.datetime.strptime(items[3].strip(), "%Y/%m/%d %H:%M:%S").replace(tzinfo=pytz.utc),
+            "datetime": record_datetime,
             "source": items[4].strip(),
             "data": items[5].strip(),
             "latitude": latitude,
             "longitude": longitude,
+            "latitude_aprs": latitude_aprs,
+            "longitude_aprs": longitude_aprs,
             "extra1": items[7].strip(),
             "extra2": items[8].strip(),
             "extra3": items[9].strip(),
@@ -119,10 +153,10 @@ class WiresX2APRS(Service, ABC):
         return values
 
     def _parse_position(self, position=""):
-        # N:39 17' 59" / E:009 12' 28"
-
         latitude = 0
         longitude = 0
+        latitude_aprs = ""
+        longitude_aprs = ""
 
         if "'" in position and "\"" in position and "/" in position:
             items = position.split("/")
@@ -130,10 +164,10 @@ class WiresX2APRS(Service, ABC):
             raw_latitude = items[0].strip()
             raw_longitude = items[1].strip()
 
-            latitude = self._parse_position_item(raw_latitude)
-            longitude = self._parse_position_item(raw_longitude)
+            latitude, latitude_aprs = self._parse_position_item(raw_latitude)
+            longitude, longitude_aprs = self._parse_position_item(raw_longitude)
 
-        return latitude, longitude
+        return latitude, longitude, latitude_aprs, longitude_aprs
 
     def _parse_position_item(self, raw_item):
         args = raw_item.split(":")
@@ -142,11 +176,34 @@ class WiresX2APRS(Service, ABC):
         arg_value = args[1]
 
         elems = arg_value.split(" ")
-        value = int(elems[0])
-        value += float(60 / int(elems[1].replace("'", "")))
-        value += float(60 / int(elems[2].replace("\"", ""))) / 60
 
-        if arg_sign.upper() in ["S", "W"]:
+        degrees = elems[0]
+        minutes = elems[1].replace("'", "")
+        seconds = elems[2].replace("\"", "")
+        sign = arg_sign.upper()
+
+        value = int(degrees)
+        value += float(int(minutes) / 60.0)
+        value += float(int(seconds) / 60.0) / 60
+
+        if sign in ["S", "W"]:
             value *= -1
 
-        return value
+        value_aprs = "%02d%02d.%02d%s" % (int(degrees), int(minutes), int(seconds), sign)
+
+        return value, value_aprs
+
+    def _send_record_to_aprs(self, record):
+        _logger.info("Sending record to APRS for %s" % record["callsign"])
+
+        callsign_items = re.split(r"[^a-zA-Z0-9]", record["callsign"])
+        callsign = callsign_items[0]
+
+        data = "%s-MP>APRS,TCPIP*:!%s/%s} %s" % (
+            callsign,
+            record["latitude_aprs"],
+            record["longitude_aprs"],
+            self._config.get("APRS-IS", "Comment"),
+        )
+
+        self._aprs.send(data)
